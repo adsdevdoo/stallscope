@@ -1,3 +1,6 @@
 *Report_*.txt
+StallScope-*.txt
+StallScope-*.csv
+StallScope-*.json
 .idea/
 .vscode/

@@ -15,12 +15,28 @@
     Or one-liner from any prompt:
         powershell -ExecutionPolicy Bypass -File .\StallScope.ps1
 
-    Output: StallScope-Report_<hostname>_<timestamp>.txt on the current user's Desktop.
+    Output: StallScope-Report_<hostname>_<timestamp>.txt on the current user's Desktop,
+    plus StallScope-Snapshot_<hostname>_<timestamp>.json. The next run compares against
+    the latest snapshot and shows what grew in between (handles, memory, kernel pool tags).
+
+    Watch mode (catch the freeze while it happens):
+        .\StallScope.ps1 -Watch -Minutes 60
+    Samples CPU/DPC/ISR, disk latency, memory and scheduler lag every second and logs
+    each stall with the processes active at that moment. Output: StallScope-Watch_*.txt + .csv.
 #>
 
 [CmdletBinding()]
 param(
-    [int]$EventLogDays = 7
+    [int]$EventLogDays = 7,
+
+    # Watch mode: sample the system every IntervalSec for Minutes (0 = until Ctrl+C)
+    # and log every second where something stalls, instead of the one-shot report.
+    [switch]$Watch,
+    [int]$Minutes = 30,
+    [int]$IntervalSec = 1,
+
+    # Snapshot to compare against for leak growth; default = latest snapshot of this host on Desktop
+    [string]$Baseline = ''
 )
 
 # --- Output preparation ------------------------------------------------------
@@ -103,6 +119,294 @@ $isAdmin = ([Security.Principal.WindowsPrincipal]`
 Add-Line "Running as Administrator: $isAdmin"
 if (-not $isAdmin) {
     Add-Line "WARNING: without admin rights, SMART/EventLog/temperatures data will be empty."
+}
+
+# ==============================================================================
+# WATCH MODE: sample every second, log the moments where the system stalls
+# ==============================================================================
+if ($Watch) {
+    $watchTxt = Join-Path $desktop "StallScope-Watch_${hostName}_${stamp}.txt"
+    $watchCsv = Join-Path $desktop "StallScope-Watch_${hostName}_${stamp}.csv"
+    $inv      = [Globalization.CultureInfo]::InvariantCulture
+    $cs       = Get-CimInstance Win32_ComputerSystem
+    $logical  = [int]$cs.NumberOfLogicalProcessors
+    $ramMB    = [double]$cs.TotalPhysicalMemory / 1MB
+    $interval = [math]::Max(1, $IntervalSec)
+    $probeFile = Join-Path $env:TEMP "stallscope-probe-$PID.tmp"
+    $probeBuf  = New-Object byte[] 4096
+
+    # Disk perf instance "0 C:" -> "0 C: (Samsung SSD 990 PRO 2TB)"
+    $diskNames = @{}
+    try { Get-PhysicalDisk | ForEach-Object { $diskNames[[string]$_.DeviceId] = $_.FriendlyName } } catch { }
+    function Get-DiskLabel([string]$inst) {
+        $num = ($inst -split ' ')[0]
+        if ($diskNames[$num]) { "$inst ($($diskNames[$num]))" } else { $inst }
+    }
+
+    # Thresholds for "this second was a stall"
+    $T = @{
+        LagMs       = 2000   # our own 1s timer fired this late -> the whole system was paused
+        SampleMs    = 3000   # WMI sampling took this long -> system was unresponsive
+        ProbeMs     = 500    # 4 KB write-through on system drive
+        DiskMs      = 100    # avg read/write latency of any physical disk in the interval
+        CpuPct      = 95     # with run queue > logical CPUs
+        DpcIntPct   = 10     # total DPC+ISR time
+        CoreDpcInt  = 50     # DPC+ISR time on a single core
+        AvailPct    = 3      # available RAM
+        CommitPct   = 95
+    }
+
+    # Raw perf classes: locale-independent, deltas computed here (formatted classes need a refresher)
+    function Get-RawSample {
+        [pscustomobject]@{
+            Cpu  = @(Get-CimInstance Win32_PerfRawData_PerfOS_Processor)
+            Sys  = Get-CimInstance Win32_PerfRawData_PerfOS_System
+            Mem  = Get-CimInstance Win32_PerfRawData_PerfOS_Memory
+            Disk = @(Get-CimInstance Win32_PerfRawData_PerfDisk_PhysicalDisk | Where-Object { $_.Name -ne '_Total' })
+            Proc = @(Get-CimInstance Win32_PerfRawData_PerfProc_Process |
+                     Where-Object { $_.Name -ne '_Total' -and $_.Name -ne 'Idle' } |
+                     Select-Object Name, IDProcess, PercentProcessorTime, IODataBytesPersec, Timestamp_Sys100NS)
+        }
+    }
+
+    function Measure-Interval($a, $b) {
+        $r = [ordered]@{}
+        $ta = $a.Cpu | Where-Object Name -eq '_Total'; $tb = $b.Cpu | Where-Object Name -eq '_Total'
+        $dt = [double]$tb.Timestamp_Sys100NS - [double]$ta.Timestamp_Sys100NS
+        if ($dt -le 0) { $dt = 1 }
+        $r.Cpu       = [math]::Max(0, [math]::Min(100, 100 * (1 - ([double]$tb.PercentProcessorTime - [double]$ta.PercentProcessorTime) / $dt)))
+        $r.Dpc       = 100 * ([double]$tb.PercentDPCTime - [double]$ta.PercentDPCTime) / $dt
+        $r.Interrupt = 100 * ([double]$tb.PercentInterruptTime - [double]$ta.PercentInterruptTime) / $dt
+        $r.CoreDpcInt = 0; $r.Core = ''
+        foreach ($cb in ($b.Cpu | Where-Object Name -ne '_Total')) {
+            $ca = $a.Cpu | Where-Object Name -eq $cb.Name
+            if (-not $ca) { continue }
+            $cdt = [double]$cb.Timestamp_Sys100NS - [double]$ca.Timestamp_Sys100NS
+            if ($cdt -le 0) { continue }
+            $v = 100 * (([double]$cb.PercentDPCTime - [double]$ca.PercentDPCTime) + ([double]$cb.PercentInterruptTime - [double]$ca.PercentInterruptTime)) / $cdt
+            if ($v -gt $r.CoreDpcInt) { $r.CoreDpcInt = $v; $r.Core = $cb.Name }
+        }
+        $r.Queue     = [int]$b.Sys.ProcessorQueueLength
+        $r.AvailMB   = [double]$b.Mem.AvailableMBytes
+        $r.CommitPct = 100 * [double]$b.Mem.CommittedBytes / [double]$b.Mem.CommitLimit
+        $mdt = ([double]$b.Mem.Timestamp_PerfTime - [double]$a.Mem.Timestamp_PerfTime) / [double]$b.Mem.Frequency_PerfTime
+        $r.PagesPerSec = if ($mdt -gt 0) { ([double]$b.Mem.PagesPersec - [double]$a.Mem.PagesPersec) / $mdt } else { 0 }
+
+        $r.Disk = ''; $r.ReadMs = 0; $r.WriteMs = 0; $r.DiskQueue = 0
+        foreach ($db in $b.Disk) {
+            $da = $a.Disk | Where-Object Name -eq $db.Name
+            if (-not $da) { continue }
+            $f  = [double]$db.Frequency_PerfTime
+            $rb = [double]$db.AvgDisksecPerRead_Base  - [double]$da.AvgDisksecPerRead_Base
+            $wb = [double]$db.AvgDisksecPerWrite_Base - [double]$da.AvgDisksecPerWrite_Base
+            $rms = if ($rb -gt 0) { 1000 * ([double]$db.AvgDisksecPerRead  - [double]$da.AvgDisksecPerRead)  / $f / $rb } else { 0 }
+            $wms = if ($wb -gt 0) { 1000 * ([double]$db.AvgDisksecPerWrite - [double]$da.AvgDisksecPerWrite) / $f / $wb } else { 0 }
+            if ([math]::Max($rms, $wms) -gt [math]::Max($r.ReadMs, $r.WriteMs)) { $r.Disk = $db.Name; $r.ReadMs = $rms; $r.WriteMs = $wms }
+            if ([int]$db.CurrentDiskQueueLength -gt $r.DiskQueue) { $r.DiskQueue = [int]$db.CurrentDiskQueueLength }
+        }
+
+        # Per-process CPU (% of whole machine) and I/O in the interval
+        $pa = @{}; foreach ($p in $a.Proc) { $pa["$($p.IDProcess)|$($p.Name)"] = $p }
+        $r.Procs = foreach ($p in $b.Proc) {
+            $q = $pa["$($p.IDProcess)|$($p.Name)"]
+            if (-not $q) { continue }
+            $pdt = [double]$p.Timestamp_Sys100NS - [double]$q.Timestamp_Sys100NS
+            if ($pdt -le 0) { continue }
+            [pscustomobject]@{
+                Name = ($p.Name -replace '#\d+$','')
+                Id   = $p.IDProcess
+                Cpu  = 100 * ([double]$p.PercentProcessorTime - [double]$q.PercentProcessorTime) / $pdt / $logical
+                IoMB = ([double]$p.IODataBytesPersec - [double]$q.IODataBytesPersec) / 1MB
+            }
+        }
+        [pscustomobject]$r
+    }
+
+    function Format-Top($procs, $prop, $unit, $n = 3) {
+        ($procs | Sort-Object $prop -Descending | Select-Object -First $n | Where-Object { $_.$prop -gt 0.05 } |
+            ForEach-Object { $svc = $script:SvcByPidW[[int]$_.Id]; $nm = if ($svc) { "$($_.Name)[$svc]" } else { $_.Name }
+                             [string]::Format($inv, '{0}({1}) {2:0.#}{3}', $nm, $_.Id, $_.$prop, $unit) }) -join ', '
+    }
+    $script:SvcByPidW = @{}
+    try {
+        Get-CimInstance Win32_Service | Where-Object { $_.ProcessId } |
+            Group-Object ProcessId | ForEach-Object { $script:SvcByPidW[[int]$_.Name] = ($_.Group.Name -join ',') }
+    } catch { }
+
+    $csvW = New-Object System.IO.StreamWriter($watchCsv, $false, [System.Text.UTF8Encoding]::new($true))
+    $csvW.AutoFlush = $true
+    $csvW.WriteLine('Time,LagMs,SampleMs,ProbeMs,CpuPct,DpcPct,InterruptPct,MaxCoreDpcIntPct,RunQueue,AvailMB,CommitPct,PagesPerSec,WorstDisk,DiskReadMs,DiskWriteMs,MaxDiskQueue,TopCpu,TopIo,Reasons')
+
+    $rows   = New-Object System.Collections.Generic.List[object]
+    $stalls = New-Object System.Collections.Generic.List[object]
+    $start  = Get-Date
+    $end    = if ($Minutes -gt 0) { $start.AddMinutes($Minutes) } else { [datetime]::MaxValue }
+
+    Write-Host ("StallScope watch: every {0}s {1}. Ctrl+C stops and still writes the summary." -f $interval,
+        $(if ($Minutes -gt 0) { "for $Minutes min (until $($end.ToString('HH:mm:ss')))" } else { 'until Ctrl+C' })) -ForegroundColor Cyan
+    Write-Host "Log: $watchCsv" -ForegroundColor Cyan
+
+    $prev = Get-RawSample
+    $sw   = [Diagnostics.Stopwatch]::StartNew()
+    $tick = 0
+    $lastStatus = Get-Date
+    try {
+        while ((Get-Date) -lt $end) {
+            $tick++
+            $planned = [double]$tick * $interval * 1000
+            $wait = $planned - $sw.ElapsedMilliseconds
+            if ($wait -gt 0) { Start-Sleep -Milliseconds ([int]$wait) }
+            $lag = [math]::Max(0, $sw.ElapsedMilliseconds - $planned)
+            $now = Get-Date
+
+            # 4 KB write-through probe: what an app saving a file would feel right now
+            $probeMs = -1
+            try {
+                $p0 = $sw.ElapsedMilliseconds
+                $fs = New-Object System.IO.FileStream($probeFile, [IO.FileMode]::Create, [IO.FileAccess]::Write,
+                                                      [IO.FileShare]::None, 4096, [IO.FileOptions]::WriteThrough)
+                $fs.Write($probeBuf, 0, $probeBuf.Length); $fs.Flush($true); $fs.Dispose()
+                $probeMs = $sw.ElapsedMilliseconds - $p0
+            } catch { }
+
+            $s0  = $sw.ElapsedMilliseconds
+            $cur = Get-RawSample
+            $sampleMs = $sw.ElapsedMilliseconds - $s0
+            $m = Measure-Interval $prev $cur
+            $prev = $cur
+
+            $reasons = New-Object System.Collections.Generic.List[string]
+            if ($lag -gt $T.LagMs)            { $reasons.Add("STALL timer late $([int]$lag) ms") }
+            if ($sampleMs -gt $T.SampleMs)    { $reasons.Add("STALL WMI sample $sampleMs ms") }
+            if ($probeMs -gt $T.ProbeMs)      { $reasons.Add("DISK probe $probeMs ms") }
+            if ([math]::Max($m.ReadMs, $m.WriteMs) -gt $T.DiskMs) {
+                $reasons.Add([string]::Format($inv, 'DISK {0} r={1:0} w={2:0} ms', (Get-DiskLabel $m.Disk), $m.ReadMs, $m.WriteMs)) }
+            if ($m.Cpu -gt $T.CpuPct -and $m.Queue -gt $logical) { $reasons.Add([string]::Format($inv, 'CPU {0:0}% queue {1}', $m.Cpu, $m.Queue)) }
+            if (($m.Dpc + $m.Interrupt) -gt $T.DpcIntPct) { $reasons.Add([string]::Format($inv, 'DPC/ISR total {0:0.#}%', $m.Dpc + $m.Interrupt)) }
+            if ($m.CoreDpcInt -gt $T.CoreDpcInt) { $reasons.Add([string]::Format($inv, 'DPC/ISR core {0} {1:0}%', $m.Core, $m.CoreDpcInt)) }
+            if (100 * $m.AvailMB / $ramMB -lt $T.AvailPct) { $reasons.Add([string]::Format($inv, 'LOW RAM {0:0} MB free', $m.AvailMB)) }
+            if ($m.CommitPct -gt $T.CommitPct) { $reasons.Add([string]::Format($inv, 'COMMIT {0:0}%', $m.CommitPct)) }
+
+            $topCpu = Format-Top $m.Procs 'Cpu' '%'
+            $topIo  = Format-Top $m.Procs 'IoMB' 'MB'
+            $row = [pscustomobject]@{
+                Time = $now; LagMs = $lag; SampleMs = $sampleMs; ProbeMs = $probeMs
+                Cpu = $m.Cpu; Dpc = $m.Dpc; Interrupt = $m.Interrupt; CoreDpcInt = $m.CoreDpcInt; Queue = $m.Queue
+                AvailMB = $m.AvailMB; CommitPct = $m.CommitPct; PagesPerSec = $m.PagesPerSec
+                Disk = $m.Disk; ReadMs = $m.ReadMs; WriteMs = $m.WriteMs; DiskQueue = $m.DiskQueue
+                TopCpu = $topCpu; TopIo = $topIo; Reasons = ($reasons -join '; ')
+            }
+            $rows.Add($row)
+            $csvW.WriteLine([string]::Format($inv,
+                '{0:yyyy-MM-dd HH:mm:ss},{1:0},{2},{3},{4:0.0},{5:0.00},{6:0.00},{7:0.0},{8},{9:0},{10:0.0},{11:0},"{12}",{13:0.0},{14:0.0},{15},"{16}","{17}","{18}"',
+                $now, $lag, $sampleMs, $probeMs, $m.Cpu, $m.Dpc, $m.Interrupt, $m.CoreDpcInt, $m.Queue, $m.AvailMB, $m.CommitPct,
+                $m.PagesPerSec, $m.Disk, $m.ReadMs, $m.WriteMs, $m.DiskQueue, $topCpu, $topIo, $row.Reasons))
+
+            if ($reasons.Count -gt 0) {
+                $stalls.Add($row)
+                Write-Host ("[{0:HH:mm:ss}] {1}  | CPU: {2}  | IO: {3}" -f $now, $row.Reasons, $topCpu, $topIo) -ForegroundColor Yellow
+            }
+            if (((Get-Date) - $lastStatus).TotalSeconds -ge 60) {
+                $lastStatus = Get-Date
+                Write-Host ("[{0:HH:mm:ss}] {1} samples, {2} flagged" -f $lastStatus, $rows.Count, $stalls.Count) -ForegroundColor DarkGray
+            }
+            # After a long stall do not fire a burst of catch-up ticks
+            $tick = [math]::Max($tick, [math]::Floor($sw.ElapsedMilliseconds / ($interval * 1000)))
+        }
+    } finally {
+        $csvW.Dispose()
+        Remove-Item -LiteralPath $probeFile -ErrorAction SilentlyContinue
+        $stop = Get-Date
+
+        Add-Header 'Watch mode summary'
+        Add-Line ("Window: {0:yyyy-MM-dd HH:mm:ss} - {1:HH:mm:ss} ({2:N1} min), interval {3}s, {4} samples, {5} flagged" -f `
+            $start, $stop, ($stop - $start).TotalMinutes, $interval, $rows.Count, $stalls.Count)
+        Add-Line "Raw per-second data: $watchCsv"
+        Add-Line ''
+        Add-Line ('Thresholds: ' + (($T.GetEnumerator() | Sort-Object Name | ForEach-Object { "$($_.Name)=$($_.Value)" }) -join ', '))
+
+        Add-SubHeader 'Metric statistics (avg / p95 / max)'
+        if ($rows.Count -gt 0) {
+            $stat = {
+                param($name, $prop, $fmt)
+                $v = @($rows | ForEach-Object { [double]$_.$prop } | Sort-Object)
+                $p95 = $v[[math]::Min($v.Count - 1, [math]::Floor($v.Count * 0.95))]
+                [pscustomobject]@{
+                    Metric = $name
+                    Avg    = [string]::Format($inv, $fmt, ($v | Measure-Object -Average).Average)
+                    P95    = [string]::Format($inv, $fmt, $p95)
+                    Max    = [string]::Format($inv, $fmt, $v[-1])
+                }
+            }
+            @(
+                & $stat 'Timer lag, ms'            LagMs       '{0:0}'
+                & $stat 'Disk probe (4KB WT), ms'  ProbeMs     '{0:0}'
+                & $stat 'CPU, %'                   Cpu         '{0:0.0}'
+                & $stat 'Run queue'                Queue       '{0:0}'
+                & $stat 'DPC, %'                   Dpc         '{0:0.00}'
+                & $stat 'Interrupt, %'             Interrupt   '{0:0.00}'
+                & $stat 'Max core DPC+ISR, %'      CoreDpcInt  '{0:0.0}'
+                & $stat 'Worst disk read, ms'      ReadMs      '{0:0.0}'
+                & $stat 'Worst disk write, ms'     WriteMs     '{0:0.0}'
+                & $stat 'Available RAM, MB'        AvailMB     '{0:0}'
+                & $stat 'Commit, %'                CommitPct   '{0:0.0}'
+                & $stat 'Pages/sec'                PagesPerSec '{0:0}'
+            ) | Format-Table -AutoSize | Out-String -Width 200 | ForEach-Object { Add-Line $_.TrimEnd() }
+        } else {
+            Add-Line '(no samples)'
+        }
+
+        Add-SubHeader 'Stall episodes (consecutive flagged seconds merged)'
+        if ($stalls.Count -eq 0) {
+            Add-Line 'No stalls detected in this window. If a freeze happened while watching, note its time - it was'
+            Add-Line 'below all thresholds (likely GPU/driver or app-level). Try a longer window or check the CSV around that time.'
+        } else {
+            $episodes = New-Object System.Collections.Generic.List[object]
+            $cur = $null
+            foreach ($s in $stalls) {
+                # Generous gap: during a stall sampling itself slows down and seconds get skipped
+                if ($cur -and ($s.Time - $cur.Last).TotalSeconds -le ($interval * 3 + 3)) {
+                    $cur.Last = $s.Time; $cur.Rows.Add($s)
+                } else {
+                    $cur = [pscustomobject]@{ First = $s.Time; Last = $s.Time; Rows = (New-Object System.Collections.Generic.List[object]) }
+                    $cur.Rows.Add($s); $episodes.Add($cur)
+                }
+            }
+            Add-Line "$($episodes.Count) episode(s):"
+            foreach ($e in $episodes) {
+                $worst = $e.Rows | Sort-Object { $_.LagMs + $_.ProbeMs + [math]::Max($_.ReadMs, $_.WriteMs) } -Descending | Select-Object -First 1
+                $kinds = ($e.Rows | ForEach-Object { $_.Reasons -split '; ' } | ForEach-Object { ($_ -split ' ')[0] } | Select-Object -Unique) -join '+'
+                Add-Line ''
+                $durSec = [int](($e.Last - $e.First).TotalSeconds) + $interval
+                Add-Line ("[{0:HH:mm:ss} - {1:HH:mm:ss}] {2}s  {3}" -f $e.First, $e.Last, $durSec, $kinds)
+                Add-Line "   worst second: $($worst.Time.ToString('HH:mm:ss')) :: $($worst.Reasons)"
+                Add-Line "   top CPU:      $($worst.TopCpu)"
+                Add-Line "   top I/O:      $($worst.TopIo)"
+            }
+            Add-Line ''
+            Add-Line 'How to read: STALL = the whole system paused (even this script); DISK = storage stall, see which'
+            Add-Line 'disk and which process did I/O; DPC/ISR = a driver hogging a core (GPU/network/audio/storage);'
+            Add-Line 'CPU = saturation with a run queue; LOW RAM/COMMIT = memory pressure and paging.'
+        }
+
+        Add-SubHeader 'System log warnings/errors during the window'
+        try {
+            $ev = Get-WinEvent -FilterHashtable @{ LogName = 'System'; Level = 1,2,3; StartTime = $start } -ErrorAction SilentlyContinue
+            if ($ev) {
+                $ev | Sort-Object TimeCreated | Select-Object -First 50 | ForEach-Object {
+                    $msg = if ($_.Message) { ($_.Message -replace "`r?`n",' ').Trim() } else { '' }
+                    if ($msg.Length -gt 160) { $msg = $msg.Substring(0,160) + '...' }
+                    Add-Line ("[{0:HH:mm:ss}] ID={1} {2} :: {3}" -f $_.TimeCreated, $_.Id, $_.ProviderName, $msg)
+                }
+            } else { Add-Line '(none)' }
+        } catch { Add-Line "[ERROR]: $($_.Exception.Message)" }
+
+        [System.IO.File]::WriteAllLines($watchTxt, $script:Lines, [System.Text.UTF8Encoding]::new($true))
+        Write-Host ''
+        Write-Host " Watch summary: $watchTxt" -ForegroundColor Green
+        Write-Host " Per-second CSV: $watchCsv" -ForegroundColor Green
+    }
+    return
 }
 
 # --- 0. Basic system info ----------------------------------------------------
@@ -339,6 +643,8 @@ function Get-ProcLabel {
     $svc = $script:SvcByPid[[int]$Proc.Id]
     if ($svc) { "$($Proc.Name) [$svc]" } else { $Proc.Name }
 }
+# Processes that legitimately hold many GB (leak checks report them at lower severity)
+$script:ExpectedHeavy = 'java','idea64','vmmem','vmmemWSL','vmwp','sqlservr','devenv','chrome','msedge','firefox','MsMpEng','Memory Compression'
 
 Try-Run {
     Add-Line "Top-10 processes by handle count:"
@@ -440,6 +746,7 @@ public static class DiagPoolTags {
 $script:PoolTop = @()
 Try-Run {
     $tags = [DiagPoolTags]::Query()
+    $script:PoolTagsAll = $tags
     $topNP = $tags | Sort-Object NonPagedUsed -Descending | Select-Object -First 10
     $topP  = $tags | Sort-Object PagedUsed    -Descending | Select-Object -First 10
 
@@ -690,6 +997,161 @@ Try-Run {
 }
 
 # ==============================================================================
+# 8. TREND VS PREVIOUS RUN (leak growth)
+# ==============================================================================
+Add-Header '8. Trend vs previous run (what grew in between)'
+Add-Line "Each run saves a snapshot (handles/memory per process, kernel pool tags) next to the report."
+Add-Line "The next run compares against the latest snapshot of this host. Run again after a few hours."
+
+$snapshotPath = Join-Path $desktop "StallScope-Snapshot_${hostName}_${stamp}.json"
+$script:Snapshot      = $null
+$script:TrendFindings = New-Object System.Collections.Generic.List[string]
+
+function ConvertTo-Dt($v) {
+    # PS 5.1 ConvertFrom-Json keeps ISO dates as strings, PS 7 turns them into DateTime
+    if ($v -is [datetime]) { $v } else { [datetime]::Parse([string]$v, $null, [Globalization.DateTimeStyles]::RoundtripKind) }
+}
+
+Try-Run {
+    $os = Get-CimInstance Win32_OperatingSystem
+    $m  = Get-CimInstance Win32_PerfRawData_PerfOS_Memory
+    $tags = if ($script:PoolTagsAll) { $script:PoolTagsAll } else { [DiagPoolTags]::Query() }
+    $script:Snapshot = [pscustomobject]@{
+        Version        = 1
+        Host           = $hostName
+        Time           = (Get-Date).ToString('o')
+        BootTime       = $os.LastBootUpTime.ToString('o')
+        CommitMB       = [math]::Round($m.CommittedBytes/1MB)
+        PagedPoolMB    = [math]::Round($m.PoolPagedBytes/1MB,1)
+        NonPagedPoolMB = [math]::Round($m.PoolNonpagedBytes/1MB,1)
+        Processes      = @(Get-Process | ForEach-Object {
+            $st = try { $_.StartTime.ToString('o') } catch { '' }
+            [pscustomobject]@{
+                Key       = "$($_.Id)|$($_.Name)|$st"   # same PID + name + start time = same process instance
+                Id        = $_.Id
+                Label     = Get-ProcLabel $_
+                Name      = $_.Name
+                Handles   = $_.HandleCount
+                PrivateMB = [math]::Round($_.PrivateMemorySize64/1MB,1)
+                Threads   = $_.Threads.Count
+            }
+        })
+        PoolTags       = @($tags | Where-Object { ($_.PagedUsed + $_.NonPagedUsed) -gt 1MB } | ForEach-Object {
+            [pscustomobject]@{ Tag = $_.Tag; PagedMB = [math]::Round($_.PagedUsed/1MB,2); NonPagedMB = [math]::Round($_.NonPagedUsed/1MB,2) }
+        })
+    }
+
+    $basePath = if ($Baseline) { $Baseline } else {
+        Get-ChildItem $desktop -Filter "StallScope-Snapshot_${hostName}_*.json" -ErrorAction SilentlyContinue |
+            Sort-Object LastWriteTime -Descending | Select-Object -First 1 -ExpandProperty FullName
+    }
+    if (-not $basePath -or -not (Test-Path -LiteralPath $basePath)) {
+        Add-Line ''
+        Add-Line "No previous snapshot found - this run becomes the baseline."
+        return
+    }
+    $base  = Get-Content -LiteralPath $basePath -Raw -Encoding UTF8 | ConvertFrom-Json
+    $hours = ((Get-Date) - (ConvertTo-Dt $base.Time)).TotalHours
+    Add-Line ''
+    Add-Line "Baseline: $basePath"
+    Add-Line ("Elapsed:  {0:N2} h" -f $hours)
+
+    if ([math]::Abs(((ConvertTo-Dt $base.BootTime) - $os.LastBootUpTime).TotalMinutes) -gt 1) {
+        Add-Line "System was rebooted after the baseline - growth comparison is meaningless. This run becomes the new baseline."
+        return
+    }
+    if ($hours -lt 0.05) { Add-Line "Baseline is less than 3 minutes old - nothing to compare yet."; return }
+    $confident = $hours -ge 0.25
+    if (-not $confident) { Add-Line "Less than 15 min since baseline: deltas shown, but no findings raised (too noisy)." }
+
+    Add-Line ''
+    [pscustomobject]@{
+        Commit_MB       = "{0} -> {1} ({2:+0;-0})" -f $base.CommitMB, $script:Snapshot.CommitMB, ($script:Snapshot.CommitMB - $base.CommitMB)
+        PagedPool_MB    = "{0} -> {1} ({2:+0;-0})" -f $base.PagedPoolMB, $script:Snapshot.PagedPoolMB, ($script:Snapshot.PagedPoolMB - $base.PagedPoolMB)
+        NonPagedPool_MB = "{0} -> {1} ({2:+0;-0})" -f $base.NonPagedPoolMB, $script:Snapshot.NonPagedPoolMB, ($script:Snapshot.NonPagedPoolMB - $base.NonPagedPoolMB)
+    } | Format-List | Out-String | ForEach-Object { Add-Line $_.Trim() }
+
+    # Processes alive in both snapshots
+    $baseProc = @{}
+    foreach ($p in $base.Processes) { $baseProc[$p.Key] = $p }
+    $diff = @(foreach ($p in $script:Snapshot.Processes) {
+        $b = $baseProc[$p.Key]
+        if (-not $b) { continue }
+        [pscustomobject]@{
+            Process        = $p.Label
+            Name           = $p.Name
+            Id             = $p.Id
+            Handles        = $p.Handles
+            dHandles       = $p.Handles - $b.Handles
+            'dHandles/h'   = [math]::Round(($p.Handles - $b.Handles) / $hours)
+            PrivateMB      = $p.PrivateMB
+            dPrivateMB     = [math]::Round($p.PrivateMB - $b.PrivateMB, 1)
+            'dPrivateMB/h' = [math]::Round(($p.PrivateMB - $b.PrivateMB) / $hours, 1)
+        }
+    })
+
+    Add-Line ''
+    Add-Line "Top growth by handles (same process instance in both snapshots):"
+    $g = $diff | Where-Object { $_.dHandles -gt 0 } | Sort-Object dHandles -Descending | Select-Object -First 10
+    if ($g) { $g | Select-Object Process, Id, Handles, dHandles, 'dHandles/h' | Format-Table -AutoSize | Out-String -Width 200 | ForEach-Object { Add-Line $_.TrimEnd() } }
+    else    { Add-Line '(nothing grew)' }
+
+    Add-Line ''
+    Add-Line "Top growth by private memory:"
+    $g = $diff | Where-Object { $_.dPrivateMB -gt 0 } | Sort-Object dPrivateMB -Descending | Select-Object -First 10
+    if ($g) { $g | Select-Object Process, Id, PrivateMB, dPrivateMB, 'dPrivateMB/h' | Format-Table -AutoSize | Out-String -Width 200 | ForEach-Object { Add-Line $_.TrimEnd() } }
+    else    { Add-Line '(nothing grew)' }
+
+    # Pool tags are case-sensitive
+    $baseTag = New-Object System.Collections.Hashtable ([StringComparer]::Ordinal)
+    foreach ($t in $base.PoolTags) { $baseTag[$t.Tag] = $t }
+    $tagDiff = @(foreach ($t in $script:Snapshot.PoolTags) {
+        $b = $baseTag[$t.Tag]
+        $bp = if ($b) { [double]$b.PagedMB } else { 0 }
+        $bn = if ($b) { [double]$b.NonPagedMB } else { 0 }
+        $d  = ($t.PagedMB - $bp) + ($t.NonPagedMB - $bn)
+        [pscustomobject]@{
+            Tag            = "'$($t.Tag)'"
+            RawTag         = $t.Tag
+            PagedMB        = $t.PagedMB
+            dPagedMB       = [math]::Round($t.PagedMB - $bp, 1)
+            NonPagedMB     = $t.NonPagedMB
+            dNonPagedMB    = [math]::Round($t.NonPagedMB - $bn, 1)
+            'dTotalMB/h'   = [math]::Round($d / $hours, 1)
+            dTotal         = $d
+        }
+    })
+    Add-Line ''
+    Add-Line "Top growth by kernel pool tag:"
+    $g = $tagDiff | Where-Object { $_.dTotal -gt 0.5 } | Sort-Object dTotal -Descending | Select-Object -First 10
+    if ($g) { $g | Select-Object Tag, PagedMB, dPagedMB, NonPagedMB, dNonPagedMB, 'dTotalMB/h' | Format-Table -AutoSize | Out-String -Width 200 | ForEach-Object { Add-Line $_.TrimEnd() } }
+    else    { Add-Line '(nothing grew)' }
+
+    if (-not $confident) { return }
+    $span = "{0:N1} h" -f $hours
+    foreach ($d in $diff) {
+        if ($d.dHandles -gt 2000 -and $d.'dHandles/h' -gt 1000) {
+            $script:TrendFindings.Add("[HIGH] Handle leak in progress: $($d.Process) (PID $($d.Id)) +$($d.dHandles) handles in $span ($($d.'dHandles/h')/h), now $($d.Handles).")
+        }
+        if ($d.dPrivateMB -gt 500 -and $d.'dPrivateMB/h' -gt 200) {
+            $sev = if ($script:ExpectedHeavy -contains $d.Name) { 'MED' } else { 'HIGH' }
+            $script:TrendFindings.Add("[$sev] Memory growing: $($d.Process) (PID $($d.Id)) +$($d.dPrivateMB) MB in $span ($($d.'dPrivateMB/h') MB/h), now $($d.PrivateMB) MB.")
+        }
+    }
+    foreach ($t in $tagDiff) {
+        if ($t.dTotal -gt 100 -and $t.'dTotalMB/h' -gt 50) {
+            $script:TrendFindings.Add("[HIGH] Kernel pool tag $($t.Tag) grew by $([math]::Round($t.dTotal)) MB in $span ($($t.'dTotalMB/h') MB/h). See owner in 'Kernel pool tags' (section 3).")
+        }
+    }
+    foreach ($pool in 'PagedPoolMB','NonPagedPoolMB') {
+        $d = $script:Snapshot.$pool - $base.$pool
+        if ($d -gt 500 -and ($d / $hours) -gt 200) {
+            $script:TrendFindings.Add("[HIGH] $pool grew by $([math]::Round($d)) MB in $span - kernel-side leak in progress.")
+        }
+    }
+}
+
+# ==============================================================================
 # AUTO-ANALYSIS SUMMARY
 # ==============================================================================
 Add-Header 'Auto-analysis - probable causes'
@@ -790,8 +1252,7 @@ try {
 
 # 11) Private memory leaks (excluding expected heavy hitters)
 try {
-    $expectedHeavy = 'java','idea64','vmmem','vmmemWSL','vmwp','sqlservr','devenv','chrome','msedge','firefox','MsMpEng','Memory Compression'
-    Get-Process | Where-Object { $_.PrivateMemorySize64 -gt 4GB -and $expectedHeavy -notcontains $_.Name } | ForEach-Object {
+    Get-Process | Where-Object { $_.PrivateMemorySize64 -gt 4GB -and $script:ExpectedHeavy -notcontains $_.Name } | ForEach-Object {
         $findings.Add("[HIGH] Memory leak suspect: $(Get-ProcLabel $_) (PID $($_.Id)) uses $([math]::Round($_.PrivateMemorySize64/1GB,1)) GB private memory. Restart/update/uninstall it and watch whether it grows again.")
     }
 } catch { }
@@ -835,6 +1296,9 @@ try {
         $findings.Add("[MED] CPU is saturated: average $([math]::Round($avg,0))% over 3 samples. Everything (including UI) gets queued - check top processes by CPU in section 3.")
     }
 } catch { }
+
+# 15) Growth since the previous snapshot (section 8)
+foreach ($f in $script:TrendFindings) { $findings.Add($f) }
 
 if ($findings.Count -eq 0) {
     Add-Line "No obvious auto-markers detected. Review sections above manually, especially #2 (event log) and #5 (power scheme)."
@@ -897,4 +1361,14 @@ try {
     Write-Host "Failed to write report: $($_.Exception.Message)" -ForegroundColor Red
     Write-Host "Dumping report contents to console:" -ForegroundColor Yellow
     $script:Lines | ForEach-Object { Write-Host $_ }
+}
+
+# --- Save snapshot for the next run's trend comparison -----------------------
+if ($script:Snapshot) {
+    try {
+        [System.IO.File]::WriteAllText($snapshotPath, ($script:Snapshot | ConvertTo-Json -Depth 4 -Compress), [System.Text.UTF8Encoding]::new($false))
+        Write-Host " Snapshot saved: $snapshotPath (baseline for the next run)" -ForegroundColor Green
+    } catch {
+        Write-Host "Failed to write snapshot: $($_.Exception.Message)" -ForegroundColor Red
+    }
 }

@@ -23,11 +23,30 @@ The report is saved to your Desktop as `StallScope-Report_<hostname>_<timestamp>
 
 Without admin rights SMART counters, the event log and kernel pool data come back empty.
 
+Next to the report it saves `StallScope-Snapshot_<hostname>_<timestamp>.json`.
+Run it again a few hours later and section 8 shows what grew in between (see [Trend vs previous run](#trend-vs-previous-run)).
+
+### Catch a freeze while it happens
+
+A one-shot report can miss a freeze that lasts seconds and happens at random. Watch mode samples the system
+every second and records each moment where something stalls:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\StallScope.ps1 -Watch -Minutes 60
+```
+
+Leave it running and keep working; when the freeze happens, the summary tells you what was going on at that second.
+See [Watch mode](#watch-mode).
+
 ### Parameters
 
 | Parameter | Default | Description |
 |-----------|---------|-------------|
 | `-EventLogDays` | `7` | How many days of System/Application event log to analyze |
+| `-Watch` | off | Watch mode instead of the one-shot report |
+| `-Minutes` | `30` | Watch duration; `0` = until Ctrl+C |
+| `-IntervalSec` | `1` | Watch sampling interval |
+| `-Baseline` | latest snapshot | Snapshot JSON to compare against (default: the latest one of this host on the Desktop) |
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File .\StallScope.ps1 -EventLogDays 14
@@ -45,6 +64,7 @@ powershell -ExecutionPolicy Bypass -File .\StallScope.ps1 -EventLogDays 14
 | 5 | Power | Active plan, PCIe ASPM, disk idle timeout, CPU min/max state, USB selective suspend, sleep states |
 | 6 | Memory | XMP/DOCP check (configured vs rated speed), voltage, totals |
 | 7 | Temperatures | ACPI thermal zones, disk temperatures |
+| 8 | Trend | Growth since the previous snapshot: handles and private memory per process, kernel pool tags, totals |
 
 ### Leak detection
 
@@ -68,6 +88,53 @@ For the top paged and non-paged tags it shows used memory, live allocations, and
 
 Short or common tags can match several drivers, so treat the owners as candidates, not proof.
 
+### Trend vs previous run
+
+A single snapshot cannot tell a leak from a process that is simply big. Every run stores a compact JSON snapshot
+(handles, threads and private memory per process instance, kernel pool tags, commit and pool totals);
+the next run compares against the latest one and reports growth per hour:
+
+```text
+Process                         Id Handles dHandles dHandles/h
+-------                         -- ------- -------- ----------
+svchost [TermService]        91704   41200    37500      18750
+```
+
+- Processes are matched by PID + name + start time, so a restarted process is never compared with its predecessor
+- If the machine was rebooted in between, the comparison is skipped and the run becomes the new baseline
+- Findings are raised only when at least 15 minutes passed (shorter intervals are too noisy)
+
+## Watch mode
+
+`-Watch` samples every second, using raw performance classes (locale-independent):
+
+| Signal | Flagged when | Meaning |
+|--------|--------------|---------|
+| Timer lag | the script's own 1 s timer fires > 2 s late | the whole system paused |
+| WMI sample time | collecting one sample takes > 3 s | the system was unresponsive |
+| Disk probe | a 4 KB write-through on the system drive takes > 500 ms | what an app saving a file feels |
+| Disk latency | avg read/write of any physical disk > 100 ms | storage stall (disk named) |
+| CPU | > 95% with run queue > logical CPUs | saturation |
+| DPC/ISR | > 10% total or > 50% on a single core | a driver hogging a core (GPU, network, audio, storage) |
+| Memory | available < 3% of RAM, commit > 95% | memory pressure |
+
+For every flagged second it records the top processes by CPU and by I/O in that second
+(`svchost` with its services). Output:
+
+- `StallScope-Watch_<hostname>_<timestamp>.csv`: every sample, written live (survives a crash or Ctrl+C)
+- `StallScope-Watch_<hostname>_<timestamp>.txt`: avg / p95 / max per metric, stall episodes (consecutive flagged
+  seconds merged) with the worst second and its top processes, and System log warnings/errors during the window
+
+```text
+[16:55:54 - 16:56:00] 7s  STALL+CPU
+   worst second: 16:55:54 :: STALL WMI sample 3741 ms; CPU 100% queue 205
+   top CPU:      pwsh(47892) 95.8%, idea64(2920) 1.7%, chrome(7052) 0.5%
+   top I/O:      chrome(7052) 6MB, chrome(15744) 5.2MB, chrome(28732) 0.9MB
+```
+
+If a freeze happened while watching but nothing was flagged, it stayed below all thresholds
+(often GPU/driver or a single hung application): check the CSV around that time.
+
 ## Auto-analysis
 
 At the end of the report every finding is tagged `[HIGH]`, `[MED]` or `[OK]`. It flags, among others:
@@ -79,6 +146,7 @@ At the end of the report every finding is tagged `[HIGH]`, `[MED]` or `[OK]`. It
 - Processes with > 100k handles, background processes with > 4 GB private memory
 - Commit charge > 85% of limit, oversized kernel pools, single pool tags > 500 MB
 - Sustained CPU saturation
+- Handles, private memory or pool tags growing since the previous snapshot
 
 Example:
 
