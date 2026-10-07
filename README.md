@@ -96,3 +96,7 @@ The report also ends with a list of the most common fixes for the 5-30 second fr
 - Some checks and recommendations are tuned for AMD Ryzen platforms with NVMe drives; the rest is platform-neutral.
 - On desktop AM4/AM5 boards ACPI thermal zones usually do not report real CPU temperature; use HWiNFO64 or Ryzen Master for that.
 - Reports contain hardware details (models, serial numbers, installed software). Review them before sharing publicly.
+
+## License
+
+[MIT](LICENSE)
