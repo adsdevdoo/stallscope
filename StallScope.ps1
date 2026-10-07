@@ -1152,6 +1152,200 @@ Try-Run {
 }
 
 # ==============================================================================
+# 9. REMOTE DESKTOP: exposure, logon attempts, TermService handles
+# ==============================================================================
+Add-Header '9. Remote Desktop (RDP)'
+Add-Line "Incoming RDP connection attempts (e.g. password guessing from the internet) go through termsrv.dll and"
+Add-Line "can leak Event handles in the TermService svchost: millions of handles -> kernel memory pressure -> stalls."
+
+$script:RdpFindings = New-Object System.Collections.Generic.List[string]
+function Test-PublicIp([string]$ip) {
+    if ([string]::IsNullOrWhiteSpace($ip) -or $ip -eq '-') { return $false }
+    -not ($ip -match '^(10\.|192\.168\.|172\.(1[6-9]|2\d|3[01])\.|127\.|169\.254\.|100\.(6[4-9]|[7-9]\d|1[01]\d|12[0-7])\.|::1$|fe80:|fc|fd|0\.0\.0\.0|::$)')
+}
+
+if (-not ('DiagHandleTypes' -as [type])) {
+    Add-Type -TypeDefinition @'
+using System;
+using System.Collections.Generic;
+using System.Runtime.InteropServices;
+public static class DiagHandleTypes {
+    [DllImport("ntdll.dll")] static extern int NtQuerySystemInformation(int cls, IntPtr buf, int len, out int ret);
+    [DllImport("ntdll.dll")] static extern int NtQueryObject(IntPtr h, int cls, IntPtr buf, int len, out int ret);
+    static Dictionary<int, string> TypeNames() {
+        var map = new Dictionary<int, string>();
+        int len = 0x10000;
+        while (true) {
+            IntPtr buf = Marshal.AllocHGlobal(len);
+            try {
+                int ret; int st = NtQueryObject(IntPtr.Zero, 3, buf, len, out ret);   // ObjectTypesInformation
+                if (st == unchecked((int)0xC0000004)) { len = Math.Max(len * 2, ret); continue; }
+                if (st != 0) return map;
+                bool x64 = IntPtr.Size == 8;
+                int n = Marshal.ReadInt32(buf);
+                long p = buf.ToInt64() + IntPtr.Size;
+                for (int i = 0; i < n; i++) {
+                    IntPtr e = new IntPtr(p);
+                    ushort nameLen = (ushort)Marshal.ReadInt16(e, 0), nameMax = (ushort)Marshal.ReadInt16(e, 2);
+                    string name = Marshal.PtrToStringUni(Marshal.ReadIntPtr(e, x64 ? 8 : 4), nameLen / 2);
+                    map[Marshal.ReadByte(e, x64 ? 90 : 82)] = name;                   // TypeIndex
+                    long next = p + (x64 ? 104 : 96) + nameMax;
+                    p = (next + IntPtr.Size - 1) / IntPtr.Size * IntPtr.Size;
+                }
+                return map;
+            } finally { Marshal.FreeHGlobal(buf); }
+        }
+    }
+    // Handle count per object type for one process (SystemExtendedHandleInformation = 64)
+    public static Dictionary<string, int> ByType(int pid) {
+        var types = TypeNames();
+        var res = new Dictionary<string, int>();
+        int len = 0x1000000;
+        while (true) {
+            IntPtr buf = Marshal.AllocHGlobal(len);
+            try {
+                int ret; int st = NtQuerySystemInformation(64, buf, len, out ret);
+                if (st == unchecked((int)0xC0000004)) { len = Math.Max(len * 2, ret + 0x100000); continue; }
+                if (st != 0) throw new Exception("NtQuerySystemInformation(64) failed, NTSTATUS 0x" + st.ToString("X8"));
+                long count = Marshal.ReadIntPtr(buf).ToInt64();
+                int size = IntPtr.Size == 8 ? 40 : 28, first = IntPtr.Size * 2;
+                for (long i = 0; i < count; i++) {
+                    IntPtr e = new IntPtr(buf.ToInt64() + first + i * size);
+                    if (Marshal.ReadIntPtr(e, IntPtr.Size).ToInt64() != pid) continue;
+                    int idx = (ushort)Marshal.ReadInt16(e, IntPtr.Size * 3 + 6);
+                    string t; if (!types.TryGetValue(idx, out t)) t = "#" + idx;
+                    int c; res.TryGetValue(t, out c); res[t] = c + 1;
+                }
+                return res;
+            } finally { Marshal.FreeHGlobal(buf); }
+        }
+    }
+}
+'@
+}
+
+Add-SubHeader 'RDP configuration'
+$rdpPort = 3389
+Try-Run {
+    $ts  = Get-ItemProperty 'HKLM:\SYSTEM\CurrentControlSet\Control\Terminal Server' -ErrorAction SilentlyContinue
+    $tcp = Get-ItemProperty 'HKLM:\SYSTEM\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -ErrorAction SilentlyContinue
+    if ($tcp.PortNumber) { $script:RdpPortNum = [int]$tcp.PortNumber } else { $script:RdpPortNum = 3389 }
+    [pscustomobject]@{
+        RdpEnabled         = ($ts.fDenyTSConnections -eq 0)
+        Port               = $script:RdpPortNum
+        NLA                = ($tcp.UserAuthentication -eq 1)
+        SecurityLayer      = $tcp.SecurityLayer
+        MinEncryptionLevel = $tcp.MinEncryptionLevel
+    } | Format-List
+    Add-Line "Account lockout policy (net accounts):"
+    # Last lines of 'net accounts' are lockout threshold/duration/window on any locale
+    (net accounts 2>$null) | Where-Object { $_ -match ':' } | Select-Object -Last 4 | ForEach-Object { Add-Line "  $_" }
+}
+if ($script:RdpPortNum) { $rdpPort = $script:RdpPortNum }
+
+Add-SubHeader 'Inbound firewall rules allowing the RDP port'
+Try-Run {
+    @(foreach ($f in (Get-NetFirewallPortFilter -Protocol TCP -ErrorAction SilentlyContinue | Where-Object { $_.LocalPort -contains [string]$rdpPort })) {
+        $r = $f | Get-NetFirewallRule
+        if ($r.Direction -ne 'Inbound' -or $r.Enabled -ne 'True' -or $r.Action -ne 'Allow') { continue }
+        [pscustomobject]@{
+            Rule          = $r.DisplayName
+            Profile       = $r.Profile
+            RemoteAddress = (($r | Get-NetFirewallAddressFilter).RemoteAddress -join ',')
+        }
+    }) | Format-Table -AutoSize -Wrap
+}
+
+Add-SubHeader 'Current TCP connections to the RDP port'
+Try-Run {
+    $conns = @(Get-NetTCPConnection -LocalPort $rdpPort -ErrorAction SilentlyContinue | Where-Object { $_.State -ne 'Listen' })
+    $pub = @($conns | Where-Object { Test-PublicIp $_.RemoteAddress })
+    Add-Line "Total: $($conns.Count), from public addresses: $($pub.Count)"
+    if ($conns) {
+        $conns | Select-Object LocalAddress, RemoteAddress, RemotePort, State,
+                               @{N='Public';E={ Test-PublicIp $_.RemoteAddress }} |
+            Sort-Object Public -Descending | Select-Object -First 20 | Format-Table -AutoSize
+    }
+    if ($pub.Count -gt 0) {
+        $script:RdpFindings.Add("[HIGH] RDP port $rdpPort is reachable from the internet: $($pub.Count) connection(s) from public addresses right now ($((($pub.RemoteAddress | Select-Object -Unique -First 5)) -join ', ')).")
+    }
+}
+
+Add-SubHeader 'TermService handles by object type'
+Try-Run {
+    $tsPid = (Get-CimInstance Win32_Service -Filter "Name='TermService'").ProcessId
+    if (-not $tsPid) { Add-Line "TermService is not running."; return }
+    $p = Get-Process -Id $tsPid -ErrorAction SilentlyContinue
+    Add-Line ("TermService PID {0}, started {1}, total handles {2}" -f $tsPid, $(try { $p.StartTime.ToString('yyyy-MM-dd HH:mm') } catch { '?' }), $p.HandleCount)
+    $byType = [DiagHandleTypes]::ByType([int]$tsPid)
+    $byType.GetEnumerator() | Sort-Object Value -Descending | Select-Object -First 8 |
+        Select-Object @{N='Type';E={$_.Key}}, @{N='Handles';E={$_.Value}} | Format-Table -AutoSize
+    $ev = [int]$byType['Event']
+    if ($ev -gt 50000) {
+        $script:RdpFindings.Add("[HIGH] TermService holds $ev Event handles (normal: a few hundred). Known pattern: Event objects leaked by termsrv/rdpcorets on incoming RDP connection attempts. Restarting TermService frees them; they grow back as long as the attempts continue.")
+    }
+}
+
+Add-SubHeader "Failed network logons (Security 4625) in the last $EventLogDays days"
+Try-Run {
+    $oldest = (Get-WinEvent -LogName Security -MaxEvents 1 -Oldest -ErrorAction SilentlyContinue).TimeCreated
+    $logCfg = Get-WinEvent -ListLog Security -ErrorAction SilentlyContinue
+    if ($oldest) {
+        $coverH = ((Get-Date) - $oldest).TotalHours
+        Add-Line ("Security log covers {0:N1} h (oldest event {1:yyyy-MM-dd HH:mm}), max size {2} MB" -f $coverH, $oldest, [math]::Round($logCfg.MaximumSizeInBytes/1MB))
+        if ($coverH -lt 24 * [math]::Min(7, $EventLogDays)) {
+            $script:RdpFindings.Add(("[MED] Security log keeps only {0:N1} h of history (max {1} MB) - older logon attempts cannot be checked." -f $coverH, [math]::Round($logCfg.MaximumSizeInBytes/1MB)))
+        }
+    }
+    $fails = @(Get-WinEvent -FilterHashtable @{ LogName = 'Security'; Id = 4625; StartTime = $since } -MaxEvents 200000 -ErrorAction SilentlyContinue)
+    # 4625 properties: [5] TargetUserName, [10] LogonType, [19] IpAddress (positional = locale-independent and fast)
+    $rows = foreach ($e in $fails) {
+        [pscustomobject]@{ Time = $e.TimeCreated; User = $e.Properties[5].Value; Type = $e.Properties[10].Value; Ip = [string]$e.Properties[19].Value }
+    }
+    $ext = @($rows | Where-Object { Test-PublicIp $_.Ip })
+    Add-Line "Failed logons: $($fails.Count), from public addresses: $($ext.Count), distinct public IPs: $(($ext.Ip | Select-Object -Unique).Count)"
+    if ($ext) {
+        $hours = [math]::Max(0.1, (($ext | Measure-Object Time -Maximum).Maximum - ($ext | Measure-Object Time -Minimum).Minimum).TotalHours)
+        Add-Line ("Rate: {0:N0} per hour" -f ($ext.Count / $hours))
+        Add-Line ''
+        Add-Line "Top source IPs:"
+        $ext | Group-Object Ip | Sort-Object Count -Descending | Select-Object -First 10 |
+            Select-Object Count, @{N='IP';E={$_.Name}},
+                          @{N='Users tried';E={ ($_.Group.User | Select-Object -Unique -First 5) -join ', ' }},
+                          @{N='Last';E={ ($_.Group | Measure-Object Time -Maximum).Maximum.ToString('MM-dd HH:mm') }} |
+            Format-Table -AutoSize | Out-String -Width 200 | ForEach-Object { Add-Line $_.TrimEnd() }
+        Add-Line "Top user names tried:"
+        $ext | Group-Object User | Sort-Object Count -Descending | Select-Object -First 10 Count, @{N='User';E={$_.Name}} |
+            Format-Table -AutoSize | Out-String | ForEach-Object { Add-Line $_.TrimEnd() }
+        $existing = @(Get-LocalUser -ErrorAction SilentlyContinue | ForEach-Object Name)
+        $hit = @($ext.User | Select-Object -Unique | Where-Object { $existing -contains $_ })
+        if ($hit) { Add-Line "Attempted names that EXIST on this machine: $($hit -join ', ')" }
+        if ($ext.Count -ge 100) {
+            $script:RdpFindings.Add(("[HIGH] Password guessing over the network: {0} failed logons from {1} public IPs (~{2:N0}/h). Top: {3}." -f `
+                $ext.Count, ($ext.Ip | Select-Object -Unique).Count, ($ext.Count / $hours),
+                (($ext | Group-Object Ip | Sort-Object Count -Descending | Select-Object -First 3 | ForEach-Object { "$($_.Name) x$($_.Count)" }) -join ', ')))
+        }
+        if ($hit) { $script:RdpFindings.Add("[HIGH] Guessed user names that exist on this machine: $($hit -join ', ').") }
+    }
+}
+
+Add-SubHeader "Successful logons from public addresses (Security 4624) in the last $EventLogDays days"
+Try-Run {
+    $ok = @(Get-WinEvent -FilterHashtable @{ LogName = 'Security'; Id = 4624; StartTime = $since } -ErrorAction SilentlyContinue)
+    # 4624 properties: [5] TargetUserName, [8] LogonType, [18] IpAddress
+    $ext = @(foreach ($e in $ok) {
+        $ip = [string]$e.Properties[18].Value
+        if (Test-PublicIp $ip) { [pscustomobject]@{ Time = $e.TimeCreated; User = $e.Properties[5].Value; LogonType = $e.Properties[8].Value; Ip = $ip } }
+    })
+    if ($ext) {
+        $ext | Sort-Object Time -Descending | Select-Object -First 20 | Format-Table -AutoSize
+        $script:RdpFindings.Add("[HIGH] $($ext.Count) successful logon(s) from public addresses: " + (($ext | Select-Object -First 3 | ForEach-Object { "$($_.Time.ToString('MM-dd HH:mm')) $($_.User)@$($_.Ip) type $($_.LogonType)" }) -join '; ') + ". Verify these were you.")
+    } else {
+        Add-Line "None (within the period the Security log still covers)."
+    }
+}
+
+# ==============================================================================
 # AUTO-ANALYSIS SUMMARY
 # ==============================================================================
 Add-Header 'Auto-analysis - probable causes'
@@ -1299,6 +1493,9 @@ try {
 
 # 15) Growth since the previous snapshot (section 8)
 foreach ($f in $script:TrendFindings) { $findings.Add($f) }
+
+# 16) Remote Desktop (section 9)
+foreach ($f in $script:RdpFindings) { $findings.Add($f) }
 
 if ($findings.Count -eq 0) {
     Add-Line "No obvious auto-markers detected. Review sections above manually, especially #2 (event log) and #5 (power scheme)."

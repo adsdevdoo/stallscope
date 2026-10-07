@@ -65,6 +65,7 @@ powershell -ExecutionPolicy Bypass -File .\StallScope.ps1 -EventLogDays 14
 | 6 | Memory | XMP/DOCP check (configured vs rated speed), voltage, totals |
 | 7 | Temperatures | ACPI thermal zones, disk temperatures |
 | 8 | Trend | Growth since the previous snapshot: handles and private memory per process, kernel pool tags, totals |
+| 9 | Remote Desktop | RDP config (port, NLA, lockout policy), firewall rules for the RDP port, current connections from public IPs, TermService handles by object type, failed network logons (4625) by IP and user name, successful logons from public IPs (4624), Security log coverage |
 
 ### Leak detection
 
@@ -103,6 +104,21 @@ svchost [TermService]        91704   41200    37500      18750
 - Processes are matched by PID + name + start time, so a restarted process is never compared with its predecessor
 - If the machine was rebooted in between, the comparison is skipped and the run becomes the new baseline
 - Findings are raised only when at least 15 minutes passed (shorter intervals are too noisy)
+
+### Remote Desktop
+
+Incoming RDP connection attempts go through `termsrv.dll` / `rdpcorets.dll` in the TermService svchost.
+Under constant password guessing from the internet some of them leak `Event` handles, and TermService slowly
+accumulates millions of handles, which shows up as periodic system stalls. Section 9 counts TermService handles
+per object type (via `SystemExtendedHandleInformation`, no external tools) and puts them next to the logon attempts:
+
+```text
+[HIGH] RDP port 3389 is reachable from the internet: 1 connection(s) from public addresses right now (203.0.113.91).
+[HIGH] Password guessing over the network: 22015 failed logons from 65 public IPs (~2 453/h). Top: 198.51.100.107 x4521, ...
+[MED] Security log keeps only 9,0 h of history (max 20 MB) - older logon attempts cannot be checked.
+```
+
+Successful logons from public addresses are listed separately so they can be verified.
 
 ## Watch mode
 
@@ -147,6 +163,7 @@ At the end of the report every finding is tagged `[HIGH]`, `[MED]` or `[OK]`. It
 - Commit charge > 85% of limit, oversized kernel pools, single pool tags > 500 MB
 - Sustained CPU saturation
 - Handles, private memory or pool tags growing since the previous snapshot
+- RDP reachable from public addresses, password guessing, Event handle leak in TermService, successful logons from public IPs
 
 Example:
 
