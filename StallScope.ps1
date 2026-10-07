@@ -1345,6 +1345,230 @@ Try-Run {
     }
 }
 
+$script:EventFindings = New-Object System.Collections.Generic.List[string]
+
+function Get-EventDataMap($e) {
+    # Named EventData fields (WHEA etc.); positional Properties are used where the layout is fixed
+    $map = [ordered]@{}
+    try { foreach ($d in ([xml]$e.ToXml()).Event.EventData.Data) { if ($d.Name) { $map[[string]$d.Name] = [string]$d.'#text' } } } catch { }
+    $map
+}
+function ConvertTo-Hex4([string]$s) {
+    if ([string]::IsNullOrWhiteSpace($s)) { return '' }
+    try {
+        $n = if ($s -match '^0x') { [Convert]::ToInt64($s.Substring(2), 16) } else { [int64]$s }
+        '{0:X4}' -f $n
+    } catch { '' }
+}
+function Format-Msg($e, [int]$max = 160) {
+    $m = if ($e.Message) { ($e.Message -replace "`r?`n", ' ' -replace '\s{2,}', ' ').Trim() } else { '' }
+    if ($m.Length -gt $max) { $m.Substring(0, $max) + '...' } else { $m }
+}
+
+# ==============================================================================
+# 10. HARDWARE ERRORS (WHEA)
+# ==============================================================================
+Add-Header "10. Hardware errors (WHEA-Logger, last $EventLogDays days)"
+Add-Line "Corrected errors are fixed by hardware but often come before visible instability:"
+Add-Line "CPU machine checks -> unstable PBO/Curve Optimizer/XMP/voltages; PCIe -> link problems (slot, riser, Gen4 signal, ASPM);"
+Add-Line "memory -> failing DIMM or unstable memory timings. Any FATAL entry explains a hard hang or reboot."
+Try-Run {
+    $whea = @(Get-WinEvent -FilterHashtable @{ LogName = 'System'; ProviderName = 'Microsoft-Windows-WHEA-Logger'; StartTime = $since } -MaxEvents 5000 -ErrorAction SilentlyContinue)
+    if (-not $whea) { Add-Line ''; Add-Line "No WHEA events in the window - GOOD sign."; return }
+
+    # PCI devices by VEN&DEV - locale-independent way to name the device behind a PCIe error
+    $pci = @{}
+    Get-PnpDevice -PresentOnly -ErrorAction SilentlyContinue | Where-Object { $_.InstanceId -like 'PCI\VEN_*' } | ForEach-Object {
+        if ($_.InstanceId -match 'VEN_([0-9A-F]{4})&DEV_([0-9A-F]{4})') { $pci["$($matches[1])&$($matches[2])"] = $_.FriendlyName }
+    }
+    $rows = foreach ($e in $whea) {
+        $d = Get-EventDataMap $e
+        $kind = switch ($e.Id) { 17 { 'PCIe' } 18 { 'CPU (fatal MCE)' } 19 { 'CPU (corrected MCE)' } 20 { 'PCIe/other (fatal)' } 46 { 'Memory' } 47 { 'Memory (corrected)' } default { "ID $($e.Id)" } }
+        $detail = @(foreach ($k in 'ErrorSource','ErrorType','ApicId','MCABank','PrimaryBusNumber','PrimaryDeviceNumber','PrimaryFunctionNumber') {
+            if ($d.Contains($k) -and $d[$k]) { "$k=$($d[$k])" } })
+        $dev = ''
+        if ($d.Contains('VendorID') -and $d.Contains('DeviceID')) {
+            $key = "$(ConvertTo-Hex4 $d['VendorID'])&$(ConvertTo-Hex4 $d['DeviceID'])"
+            $dev = if ($pci[$key]) { "$($pci[$key]) [$key]" } else { "VEN&DEV $key" }
+        }
+        [pscustomobject]@{
+            Time     = $e.TimeCreated
+            Id       = $e.Id
+            Severity = if ($e.Level -le 2) { 'FATAL/ERROR' } else { 'corrected' }
+            Kind     = $kind
+            Device   = $dev
+            Detail   = ($detail -join ' ')
+        }
+    }
+    Add-Line ''
+    Add-Line "WHEA events: $($rows.Count)"
+    $rows | Group-Object Id, Severity, Kind, Device, Detail | Sort-Object Count -Descending | Select-Object -First 15 |
+        ForEach-Object {
+            $g = $_.Group
+            [pscustomobject]@{
+                Count    = $_.Count
+                Severity = $g[0].Severity
+                Kind     = $g[0].Kind
+                Device   = $g[0].Device
+                Detail   = $g[0].Detail
+                First    = ($g | Measure-Object Time -Minimum).Minimum.ToString('MM-dd HH:mm')
+                Last     = ($g | Measure-Object Time -Maximum).Maximum.ToString('MM-dd HH:mm')
+            }
+        } | Format-Table -AutoSize -Wrap | Out-String -Width 220 | ForEach-Object { Add-Line $_.TrimEnd() }
+    Add-Line ''
+    Add-Line "Latest 5 messages:"
+    $whea | Sort-Object TimeCreated -Descending | Select-Object -First 5 | ForEach-Object {
+        Add-Line ("[{0:yyyy-MM-dd HH:mm:ss}] ID={1} :: {2}" -f $_.TimeCreated, $_.Id, (Format-Msg $_ 200))
+    }
+
+    $fatal = @($rows | Where-Object Severity -eq 'FATAL/ERROR')
+    if ($fatal) {
+        $script:EventFindings.Add("[HIGH] $($fatal.Count) FATAL hardware error(s) logged by WHEA (" + (($fatal | Group-Object Kind | ForEach-Object { "$($_.Name) x$($_.Count)" }) -join ', ') + "). Hard hangs/reboots are expected; check section 10.")
+    }
+    foreach ($g in ($rows | Where-Object Severity -eq 'corrected' | Group-Object Kind)) {
+        $sev  = if ($g.Count -ge 50) { 'HIGH' } else { 'MED' }
+        $hint = switch -Wildcard ($g.Name) {
+            'CPU*'    { 'On Ryzen usually unstable PBO/Curve Optimizer, too low SoC/VDDG voltage or XMP/FCLK; test at stock settings.' }
+            'PCIe*'   { 'Check the device above: reseat it, avoid risers, force PCIe Gen3 in BIOS, disable ASPM for that slot.' }
+            'Memory*' { 'Run a memory test (TestMem5/MemTest86) at current XMP; try stock speed.' }
+            default   { 'See section 10 for details.' }
+        }
+        $devs = ($g.Group.Device | Where-Object { $_ } | Select-Object -Unique -First 2) -join '; '
+        $script:EventFindings.Add("[$sev] $($g.Count) corrected $($g.Name) hardware error(s)$(if ($devs) { " on $devs" }). $hint")
+    }
+}
+
+# ==============================================================================
+# 11. HANGS, CRASHES, GPU DRIVER RESETS, RESOURCE EXHAUSTION
+# ==============================================================================
+Add-Header "11. Hangs, crashes, GPU driver resets, resource exhaustion (last $EventLogDays days)"
+
+Add-SubHeader 'GPU driver resets (Display 4101 = TDR; WER LiveKernelEvent 117/141)'
+Add-Line "A TDR freezes the screen for 2-10 s and then 'recovers' - from the user's side it looks exactly like a system freeze."
+$script:HangTimes = New-Object System.Collections.Generic.List[object]
+Try-Run {
+    $tdr = @(Get-WinEvent -FilterHashtable @{ LogName = 'System'; Id = 4101; StartTime = $since } -ErrorAction SilentlyContinue)
+    # WER 1001 properties: [2] EventName, [5] P1 (live dump code), [15] attached files, [19] report id.
+    # WER re-submits queued reports every few hours, so the same old dump shows up hundreds of times:
+    # dedupe by report id and take the real time from the dump file name (NAME-YYYYMMDD-HHMM.dmp).
+    $lkeRaw = @(Get-WinEvent -FilterHashtable @{ LogName = 'Application'; ProviderName = 'Windows Error Reporting'; Id = 1001; StartTime = $since } -MaxEvents 3000 -ErrorAction SilentlyContinue |
+                Where-Object { $_.Properties.Count -gt 19 -and [string]$_.Properties[2].Value -eq 'LiveKernelEvent' })
+    $lke = @($lkeRaw | Group-Object { [string]$_.Properties[19].Value } | ForEach-Object {
+        $e = $_.Group[0]
+        $dump = ''; $dumpTime = $null
+        if ([string]$e.Properties[15].Value -match 'LiveKernelReports\\(?:[^\\]+\\)?([^\\\r\n]+-(\d{8})-(\d{4})\.dmp)') {
+            $dump = $matches[1]
+            $dumpTime = [datetime]::ParseExact("$($matches[2])$($matches[3])", 'yyyyMMddHHmm', $null)
+        }
+        [pscustomobject]@{ Code = [string]$e.Properties[5].Value; Dump = $dump; DumpTime = $dumpTime; Submissions = $_.Count
+                           LastSubmit = ($_.Group | Measure-Object TimeCreated -Maximum).Maximum }
+    })
+    $lkeNew = @($lke | Where-Object { $_.DumpTime -and $_.DumpTime -ge $since })
+    $lkeOld = @($lke | Where-Object { -not ($_.DumpTime -and $_.DumpTime -ge $since) })
+    # Dump files written in the window (covers reports WER never logged)
+    $dumpFiles = @(Get-ChildItem "$env:SystemRoot\LiveKernelReports" -Recurse -File -Filter *.dmp -ErrorAction SilentlyContinue |
+                   Where-Object { $_.LastWriteTime -ge $since })
+
+    Add-Line "Display 4101 (TDR): $($tdr.Count); live kernel dumps in window: $($dumpFiles.Count); WER LiveKernelEvent reports: $($lke.Count) distinct ($($lkeRaw.Count) submissions)"
+    foreach ($e in ($tdr | Sort-Object TimeCreated -Descending | Select-Object -First 10)) {
+        $drv = if ($e.Properties.Count -gt 0) { $e.Properties[0].Value } else { '' }
+        Add-Line ("[{0:yyyy-MM-dd HH:mm:ss}] TDR driver={1}" -f $e.TimeCreated, $drv)
+        $script:HangTimes.Add([pscustomobject]@{ Time = $e.TimeCreated; What = "TDR $drv" })
+    }
+    foreach ($f in ($dumpFiles | Sort-Object LastWriteTime -Descending | Select-Object -First 10)) {
+        Add-Line ("[{0:yyyy-MM-dd HH:mm:ss}] live dump {1}\{2} ({3:N0} MB)" -f $f.LastWriteTime, $f.Directory.Name, $f.Name, ($f.Length/1MB))
+        $script:HangTimes.Add([pscustomobject]@{ Time = $f.LastWriteTime; What = "live dump $($f.Directory.Name)" })
+    }
+    if ($lke) {
+        Add-Line ''
+        Add-Line "WER LiveKernelEvent reports (117/141 = GPU timeout, others = driver live dumps):"
+        $lke | Sort-Object LastSubmit -Descending | Select-Object Code, Dump,
+            @{N='DumpTime';E={ if ($_.DumpTime) { $_.DumpTime.ToString('yyyy-MM-dd HH:mm') } else { '?' } }},
+            Submissions, @{N='LastSubmit';E={ $_.LastSubmit.ToString('MM-dd HH:mm') }} |
+            Format-Table -AutoSize | Out-String -Width 200 | ForEach-Object { Add-Line $_.TrimEnd() }
+        if ($lkeOld) {
+            Add-Line "Reports with a dump older than the window are old reports stuck in the WER queue (re-sent every few hours) - not new events."
+        }
+    }
+    $gpuNew = @($lkeNew | Where-Object { $_.Code -in '117','141' }) + @($dumpFiles | Where-Object { $_.Directory.Name -eq 'WATCHDOG' })
+    if ($tdr.Count -gt 0 -or $gpuNew.Count -gt 0) {
+        $script:EventFindings.Add("[HIGH] GPU driver timed out/reset in the window: $($tdr.Count) TDR(s), $($gpuNew.Count) GPU watchdog dump(s). Each one is a 2-10 s screen freeze. Clean-install the GPU driver (DDU), remove GPU overclock/undervolt, check GPU temperature and PCIe slot.")
+    }
+    $stuck = @($lkeOld | Where-Object { $_.Submissions -ge 10 })
+    if ($stuck) {
+        $script:EventFindings.Add("[OK] $($stuck.Count) old LiveKernelEvent report(s) stuck in the WER queue ($(($stuck | Measure-Object Submissions -Sum).Sum) re-submissions) - noise, not new GPU resets. Clearing C:\ProgramData\Microsoft\Windows\WER\ReportQueue stops it.")
+    }
+}
+
+Add-SubHeader 'Application hangs (Application Hang 1002)'
+Try-Run {
+    # 1002 properties: [0] application name
+    $hangs = @(Get-WinEvent -FilterHashtable @{ LogName = 'Application'; ProviderName = 'Application Hang'; Id = 1002; StartTime = $since } -MaxEvents 3000 -ErrorAction SilentlyContinue)
+    Add-Line "Hang events: $($hangs.Count)"
+    if (-not $hangs) { return }
+    $rows = foreach ($e in $hangs) { [pscustomobject]@{ Time = $e.TimeCreated; App = [string]$e.Properties[0].Value } }
+    $rows | Group-Object App | Sort-Object Count -Descending | Select-Object -First 10 Count, @{N='Application';E={$_.Name}},
+        @{N='Last';E={ ($_.Group | Measure-Object Time -Maximum).Maximum.ToString('MM-dd HH:mm') }} |
+        Format-Table -AutoSize | Out-String -Width 200 | ForEach-Object { Add-Line $_.TrimEnd() }
+    foreach ($r in $rows) { $script:HangTimes.Add([pscustomobject]@{ Time = $r.Time; What = "hang $($r.App)" }) }
+
+    $top = $rows | Group-Object App | Sort-Object Count -Descending | Select-Object -First 1
+    if ($top.Count -ge 3) {
+        $script:EventFindings.Add("[MED] $($top.Name) hung $($top.Count) time(s) in the window - an app-level freeze, or the app is the first victim of a system stall (see 'Stall moments' in section 11).")
+    }
+}
+
+Add-SubHeader 'Application crashes (Application Error 1000)'
+Try-Run {
+    # 1000 properties: [0] application, [3] faulting module
+    $crashes = @(Get-WinEvent -FilterHashtable @{ LogName = 'Application'; ProviderName = 'Application Error'; Id = 1000; StartTime = $since } -MaxEvents 3000 -ErrorAction SilentlyContinue)
+    Add-Line "Crash events: $($crashes.Count)"
+    if (-not $crashes) { return }
+    $crashes | Group-Object { "$($_.Properties[0].Value) / $($_.Properties[3].Value)" } | Sort-Object Count -Descending | Select-Object -First 10 Count,
+        @{N='Application / faulting module';E={$_.Name}},
+        @{N='Last';E={ ($_.Group | Measure-Object TimeCreated -Maximum).Maximum.ToString('MM-dd HH:mm') }} |
+        Format-Table -AutoSize | Out-String -Width 200 | ForEach-Object { Add-Line $_.TrimEnd() }
+    $shell = @($crashes | Where-Object { [string]$_.Properties[0].Value -in 'explorer.exe','dwm.exe' })
+    if ($shell) {
+        $script:EventFindings.Add("[MED] explorer.exe/dwm.exe crashed $($shell.Count) time(s) - the desktop freezes until they restart. See faulting modules in section 11.")
+    }
+}
+
+Add-SubHeader 'Resource exhaustion (Resource-Exhaustion-Detector 2004)'
+Try-Run {
+    $rex = @(Get-WinEvent -FilterHashtable @{ LogName = 'System'; ProviderName = 'Microsoft-Windows-Resource-Exhaustion-Detector'; StartTime = $since } -MaxEvents 200 -ErrorAction SilentlyContinue)
+    Add-Line "Events: $($rex.Count)"
+    foreach ($e in ($rex | Sort-Object TimeCreated -Descending | Select-Object -First 5)) {
+        Add-Line ("[{0:yyyy-MM-dd HH:mm:ss}] ID={1} :: {2}" -f $e.TimeCreated, $e.Id, (Format-Msg $e 300))
+        $script:HangTimes.Add([pscustomobject]@{ Time = $e.TimeCreated; What = 'resource exhaustion' })
+    }
+    if ($rex) {
+        $script:EventFindings.Add("[HIGH] Windows ran out of virtual memory $($rex.Count) time(s) (Resource-Exhaustion-Detector). The message in section 11 names the top consumers.")
+    }
+}
+
+Add-SubHeader 'Stall moments (several apps hung / GPU reset in the same minute)'
+Add-Line "When different applications hang in the same minute, the cause is system-wide, not in the apps."
+Try-Run {
+    $moments = @($script:HangTimes | Group-Object { $_.Time.ToString('yyyy-MM-dd HH:mm') } |
+                 Where-Object { ($_.Group.What | Select-Object -Unique).Count -ge 2 } | Sort-Object Name -Descending)
+    if (-not $moments) { Add-Line "None."; return }
+    foreach ($m in ($moments | Select-Object -First 15)) {
+        Add-Line ("[{0}] {1}" -f $m.Name, (($m.Group.What | Select-Object -Unique) -join ', '))
+    }
+    $script:EventFindings.Add("[HIGH] $($moments.Count) system-wide stall moment(s): several apps hung / GPU reset in the same minute (latest $($moments[0].Name)). Correlate these times with section 2 and with -Watch mode.")
+}
+
+Add-SubHeader 'Reliability Monitor: stability index per day (10 = no failures)'
+Try-Run {
+    $wmiSince = [Management.ManagementDateTimeConverter]::ToDmtfDateTime($since)
+    $metrics = @(Get-CimInstance Win32_ReliabilityStabilityMetrics -Filter "TimeGenerated > '$wmiSince'" -ErrorAction SilentlyContinue)
+    if (-not $metrics) { Add-Line "No data (Reliability Analysis task may be disabled on Windows Server)."; return }
+    $metrics | Group-Object { $_.TimeGenerated.ToString('yyyy-MM-dd') } | Sort-Object Name |
+        Select-Object @{N='Day';E={$_.Name}}, @{N='MinIndex';E={ [math]::Round(($_.Group | Measure-Object SystemStabilityIndex -Minimum).Minimum, 2) }} |
+        Format-Table -AutoSize
+}
+
 # ==============================================================================
 # AUTO-ANALYSIS SUMMARY
 # ==============================================================================
@@ -1496,6 +1720,9 @@ foreach ($f in $script:TrendFindings) { $findings.Add($f) }
 
 # 16) Remote Desktop (section 9)
 foreach ($f in $script:RdpFindings) { $findings.Add($f) }
+
+# 17) WHEA, GPU resets, hangs, crashes, resource exhaustion (sections 10-11)
+foreach ($f in $script:EventFindings) { $findings.Add($f) }
 
 if ($findings.Count -eq 0) {
     Add-Line "No obvious auto-markers detected. Review sections above manually, especially #2 (event log) and #5 (power scheme)."

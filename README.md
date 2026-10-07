@@ -66,6 +66,8 @@ powershell -ExecutionPolicy Bypass -File .\StallScope.ps1 -EventLogDays 14
 | 7 | Temperatures | ACPI thermal zones, disk temperatures |
 | 8 | Trend | Growth since the previous snapshot: handles and private memory per process, kernel pool tags, totals |
 | 9 | Remote Desktop | RDP config (port, NLA, lockout policy), firewall rules for the RDP port, current connections from public IPs, TermService handles by object type, failed network logons (4625) by IP and user name, successful logons from public IPs (4624), Security log coverage |
+| 10 | Hardware errors | WHEA-Logger: fatal vs corrected, CPU machine checks / PCIe (device resolved by VEN&DEV) / memory |
+| 11 | Hangs and resets | GPU driver resets (TDR 4101, live kernel dumps, WER LiveKernelEvent deduplicated by report), app hangs (1002), app crashes (1000), resource exhaustion (2004), **stall moments** (several apps hung or GPU reset in the same minute), Reliability Monitor stability index per day |
 
 ### Leak detection
 
@@ -164,6 +166,9 @@ At the end of the report every finding is tagged `[HIGH]`, `[MED]` or `[OK]`. It
 - Sustained CPU saturation
 - Handles, private memory or pool tags growing since the previous snapshot
 - RDP reachable from public addresses, password guessing, Event handle leak in TermService, successful logons from public IPs
+- Fatal or repeated corrected WHEA hardware errors, with a hint per component
+- GPU driver resets in the window; old LiveKernelEvent reports stuck in the WER queue are reported as noise, not as new resets
+- Repeated app hangs, explorer/dwm crashes, virtual memory exhaustion, system-wide stall moments
 
 Example:
 
